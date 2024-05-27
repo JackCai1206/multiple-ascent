@@ -1,5 +1,5 @@
-from typing import List, TypedDict
-from transformers import HfArgumentParser, set_seed, AutoModelForCausalLM, AutoTokenizer, GenerationConfig, LlamaForCausalLM, LlamaTokenizerFast
+from typing import List, Tuple, TypedDict
+from transformers import HfArgumentParser, set_seed, AutoModelForCausalLM, AutoTokenizer, GenerationConfig, LlamaForCausalLM, LlamaTokenizerFast, BitsAndBytesConfig
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation.candidate_generator import _crop_past_key_values
 from accelerate import Accelerator
@@ -28,8 +28,8 @@ class ScriptArguments:
     out_file: str = 'results.csv'
 
     input_dim: int = 2
-    max_w: int = 1000
-    max_x: int = 1000
+    max_w: int = 100
+    max_x: int = 100
 
 
 class IntegerRegressionModel(torch.nn.Module):
@@ -100,11 +100,22 @@ def int_or_nan(x):
     except:
         return np.nan
 
+def get_bnb_config(model_name):
+    if 'meta-llama/Meta-Llama-3-70B' in model_name:
+        return BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+    else:
+        return None
+
 @torch.no_grad()
 def main():
     parser = HfArgumentParser((ScriptArguments))
 
-    config: ScriptArguments = parser.parse_args_into_dataclasses()[0]
+    config = parser.parse_args_into_dataclasses()[0]
+    config: ScriptArguments
 
     set_seed(config.seed)
 
@@ -113,7 +124,8 @@ def main():
     dataset = Dataset.from_generator(get_dataset_generator, gen_kwargs={'num_examples': config.num_test_examples, 'model': sim_model, 'config': config})
     dataset.set_format(type='torch', output_all_columns=True)
 
-    model = AutoModelForCausalLM.from_pretrained(config.model_name, torch_dtype=torch.bfloat16, device_map=config.device)
+    bnb_config = get_bnb_config(config.model_name)
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, torch_dtype=torch.bfloat16, device_map='auto', quantization_config=bnb_config, attn_implementation="flash_attention_2")
     tokenizer = AutoTokenizer.from_pretrained(config.model_name, padding_side='left')
     tokenizer.pad_token = tokenizer.eos_token
     
