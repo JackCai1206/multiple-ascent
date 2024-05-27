@@ -125,7 +125,7 @@ def main():
     dataset.set_format(type='torch', output_all_columns=True)
 
     bnb_config = get_bnb_config(config.model_name)
-    model = AutoModelForCausalLM.from_pretrained(config.model_name, torch_dtype=torch.bfloat16, device_map='auto', quantization_config=bnb_config, attn_implementation="flash_attention_2")
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, torch_dtype=torch.bfloat16, device_map=config.device, quantization_config=bnb_config, attn_implementation="flash_attention_2")
     tokenizer = AutoTokenizer.from_pretrained(config.model_name, padding_side='left')
     tokenizer.pad_token = tokenizer.eos_token
     
@@ -140,7 +140,7 @@ def main():
         answers = prompt_model(model, tokenizer, batch, config)
         targets = dataset['targets'][bi:bi+bz, config.prompt_size_step::config.prompt_size_step]
         mse += evaluate(answers, targets)
-    mse /= len(dataset)
+    mse /= len(dataset) 
     result_table = wandb.Table(columns=['Prompt size', 'MSE'], data=[[(i+1)*config.prompt_size_step, mse[i].item()] for i in range(len(mse))])
     wandb.log({'MSE vs Prompt Size': result_table})
 
