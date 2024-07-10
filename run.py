@@ -208,8 +208,7 @@ def main():
     config = cast(ScriptArguments, parser.parse_args_into_dataclasses()[0])
 
     set_seed(config.seed)
-    hasher = fingerprint.Hasher()
-    fp = hasher.hash(config)
+    fp = repr(config)
 
     sim_model = IntegerRegressionModel(config)
 
@@ -256,6 +255,7 @@ def main():
         torch.save(all_answers, f'{config.out_dir}/cache/{fp}/answers.pt')
         torch.save(all_targets, f'{config.out_dir}/cache/{fp}/targets.pt')
         json.dump(config.__dict__, open(f'{config.out_dir}/cache/{fp}/config.json', 'w'))
+        print('Saved cache to ', f'{config.out_dir}/cache/{fp}')
     else:
         all_answers = torch.load(f'{config.out_dir}/cache/{fp}/answers.pt')
         all_targets = torch.load(f'{config.out_dir}/cache/{fp}/targets.pt')
