@@ -1,6 +1,8 @@
 import json
 import re
-from typing import List, Tuple, TypedDict, cast
+from typing import List, Literal, Optional, Tuple, TypedDict, cast
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.linear_model import LinearRegression
 from transformers import HfArgumentParser, set_seed, AutoModelForCausalLM, AutoTokenizer, GenerationConfig, LlamaForCausalLM, LlamaTokenizerFast, BitsAndBytesConfig
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation.candidate_generator import _crop_past_key_values
@@ -15,70 +17,95 @@ import wandb
 import anthropic
 from together import Together
 import os
-import string
+from random import sample
+
+@dataclass
+class MetaArguments:
+    use_cache: bool = True
 
 @dataclass
 class ScriptArguments:
+    # project arguments
     wandb_project: str = 'multiple-acsent'
     debug: bool = False
     out_dir: str = 'results'
-    
-    api: str | None = None
-    model_name: str = "meta-llama/Meta-Llama-3-8B"
-    batch_size: int | None = None
     seed: int = 42
     device: str = 'cuda:0'
 
+    # model arguments
+    api: str | None = None
+    model_name: str = "meta-llama/Meta-Llama-3-8B"
+    batch_size: int | None = None
     max_new_tokens: int = 10
+
+    # dataset arguments
     pz_end: int = 800
     pz_start: int = 20
     pz_count: int = 5
     pz_dist: str = 'uniform'
     num_test_examples: int = 100
+    test_x_range: Optional[List[int]] = field(default_factory=lambda: [0, 1000])
 
     input_dim: int = 2
-    max_w: int = 1000
-    max_x: int = 1000
-
+    w_range: List[int] = field(default_factory=lambda: [0, 1000])
+    x_range: List[int] = field(default_factory=lambda: [0, 1000])
+    dataset_type: Literal['default', 'shuffle'] = 'default'
+    
+    def __post_init__(self):
+        if self.test_x_range is None:
+            self.test_x_range = self.x_range
 
 class IntegerRegressionModel(torch.nn.Module):
     def __init__(self, config: ScriptArguments):
         super(IntegerRegressionModel, self).__init__()
-        self.linear = torch.nn.Linear(config.input_dim, 1)
-        self.linear.weight.data = torch.randint(0, config.max_w, self.linear.weight.data.shape).float()
+        self.linear = torch.nn.Linear(config.input_dim, 1, bias=False)
+        self.linear.weight.data = torch.randint(*config.w_range, self.linear.weight.data.shape).float()
 
     def forward(self, x):
         return torch.round(self.linear(x))
 
 def get_dataset_generator(num_examples, model, config: ScriptArguments):
     def get_example():
-        x = torch.randint(0, config.max_x, (config.input_dim,)).float()
+        if j < config.pz_end:
+            r = config.x_range
+        else:
+            r = config.test_x_range 
+        x = torch.randint(*r, (config.input_dim,)).float()
         with torch.no_grad():
             y = model(x).int().numpy()[0]
         return x.int().numpy(), y
+
     for i in range(num_examples):
         # set_seed(config.seed + i) # make sure the same sequrence of examples
-        examples = []
-        targets = []
-        for j in range(config.pz_end + 1):
-            x, y = get_example()
-            x_str = ', '.join([str(x_i) for x_i in x])
-            examples.append(f'\nx={x_str}; y=')
-            targets.append(y)
+        if i > 0 and config.dataset_type == 'shuffle': # shuffle the same examples
+            ind = sample(range(len(examples)), len(examples))
+            examples, targets = [examples[r] for r in ind], [targets[r] for r in ind]
+        else:
+            examples = []
+            targets = []
+            xs, ys = [], []
+            for j in range(config.pz_end + 1):
+                x, y = get_example()
+                x_str = ', '.join([str(x_i) for x_i in x])
+                examples.append(f'\nx={x_str}; y=')
+                targets.append(y)
+                xs.append(x)
+                ys.append(y)
         yield {
             'examples': examples,
-            'targets': targets
+            'targets': targets,
+            'x': xs,
+            'y': ys
         }
 
 def build_prompt(examples: List[List[str]], targets: List[List[int]], pz: int):
-    # only return the diff between the last prompt size and the current prompt size
     prompt = []
     for j in range(len(examples)):
         prompt.append(
             ''.join([f'{examples[j][i]}{targets[j][i]}' for i in range(pz)]) + examples[j][pz]
         )
     
-    return prompt   
+    return prompt
 
 def get_pz_list(config: ScriptArguments):
     if config.pz_dist == 'uniform':
@@ -125,9 +152,9 @@ def prompt_claude(batch, pz_list, config):
         prompt = build_prompt(batch['examples'], batch['targets'], pz)[0]
         message = client.messages.create(
             model=config.model_name,
-            max_tokens=10,
+            max_tokens=config.max_new_tokens,
             temperature=0.0,
-            system="Find the best fit given the existing datapoints. Respond with only an integer valued answer and nothing else. Do not include any explanations.",
+            system="Find the answer given the existing datapoints. Respond with only an integer valued answer and nothing else. Do not include any explanations.",
             messages=[
                 {"role": "user", "content": prompt}
             ]
@@ -137,7 +164,7 @@ def prompt_claude(batch, pz_list, config):
             print('Cannot parse output: ', prompt, message.content[0].text)
         answers.append(answers_bi)
         total_tokens += message.usage.input_tokens
-        tqdm_obj.set_postfix({'Total tokens sent': total_tokens})
+        tqdm_obj.set_postfix({'Sent': message.usage.input_tokens})
     answers = torch.tensor(answers).unsqueeze(0) # (1, prompt_size)
     print('Total tokens sent: ', total_tokens)
     return answers
@@ -155,7 +182,7 @@ def prompt_together_ai(batch, pz_list, config):
         output = together.completions.create(
             prompt=f"{prompt}",
             model=config.model_name,
-            max_tokens=5,
+            max_tokens=config.max_new_tokens,
             temperature=0.0,
             top_k=1,
             top_p=1
@@ -174,13 +201,31 @@ def prompt_together_ai(batch, pz_list, config):
     answers = torch.tensor(answers).unsqueeze(0)  # (1, prompt_size)
     return answers
 
+def get_baseline(batch, pz_list, config: ScriptArguments):
+    if config.model_name == 'KNN':
+        model = KNeighborsRegressor(n_neighbors=min(5, min(pz_list)))
+    elif config.model_name == 'Linear':
+        model = LinearRegression()
+    else:
+        raise ValueError('Invalid model_name')
+    answers = []
+    for pz in pz_list:
+        x_train = batch['x'][0][:pz]
+        y_train = batch['y'][0][:pz]
+        x_test = batch['x'][0][pz].unsqueeze(0)
+        answers_bi = model.fit(x_train, y_train).predict(x_test).tolist()
+        answers.append(answers_bi)
+    answers = torch.tensor(answers).T # (1, prompt_size)
+
+    return answers
+
 def evaluate(outputs, targets, config: ScriptArguments):
     acc = torch.mean((outputs == targets).float(), dim=0)
 
     outputs = outputs.float()
     targets = targets.float() # would casting first lose precision? 
     mse = torch.sqrt(torch.mean((outputs - targets) ** 2, dim=0))
-    mse /= config.max_w * config.max_x # normalize the mse
+    mse /= (config.w_range[1] - config.w_range[0]) * (config.x_range[1] - config.x_range[0]) # normalize the mse
     # breakpoint()
     return mse, acc
 
@@ -203,34 +248,49 @@ def get_bnb_config(model_name):
 
 @torch.no_grad()
 def main():
-    parser = HfArgumentParser((ScriptArguments))
+    config, meta_args = HfArgumentParser((ScriptArguments, MetaArguments)).parse_args_into_dataclasses()
 
-    config = cast(ScriptArguments, parser.parse_args_into_dataclasses()[0])
+    config = cast(ScriptArguments, config)
+    meta_args = cast(MetaArguments, meta_args) # meta args are not used for fingerprinting
 
     set_seed(config.seed)
-    fp = repr(config)
+    # fp = repr(config)
+    fp = fingerprint.Hasher().hash(tuple(sorted(config.__dict__.items())))
+    print(config)
+    print(fp)
+
+    cache_found = False
+    if meta_args.use_cache and os.path.exists(f'{config.out_dir}/cache/{fp}'):
+        try:
+            all_answers = torch.load(f'{config.out_dir}/cache/{fp}/answers.pt')
+            all_targets = torch.load(f'{config.out_dir}/cache/{fp}/targets.pt')
+            cache_found = True
+        except:
+            print('Cache not found')
 
     sim_model = IntegerRegressionModel(config)
+    print(sim_model.state_dict())
 
     dataset = Dataset.from_generator(get_dataset_generator, gen_kwargs={'num_examples': config.num_test_examples, 'model': sim_model, 'config': config})
     dataset.set_format(type='torch', output_all_columns=True)
 
-    if config.api is not None:
-        model = None
-        tokenizer = None
-    else:
-        bnb_config = get_bnb_config(config.model_name)
-        model = AutoModelForCausalLM.from_pretrained(config.model_name, torch_dtype=torch.bfloat16, device_map=config.device, quantization_config=bnb_config, attn_implementation="flash_attention_2")
-        tokenizer = AutoTokenizer.from_pretrained(config.model_name, padding_side='left')
-        tokenizer.pad_token = tokenizer.eos_token
+    if not cache_found:
+        os.makedirs(f'{config.out_dir}/cache/{fp}', exist_ok=True)
 
-    wandb.init(project=config.wandb_project, config=config, mode='disabled', name=f'{config.model_name}-{config.input_dim}-{config.max_x}-{config.max_w}')
+        if config.api is not None:
+            model = None
+            tokenizer = None
+        else:
+            bnb_config = get_bnb_config(config.model_name)
+            model = AutoModelForCausalLM.from_pretrained(config.model_name, torch_dtype=torch.bfloat16, device_map=config.device, quantization_config=bnb_config, attn_implementation="flash_attention_2")
+            tokenizer = AutoTokenizer.from_pretrained(config.model_name, padding_side='left')
+            tokenizer.pad_token = tokenizer.eos_token
 
-    pz_list = get_pz_list(config)
-    if not os.path.exists(f'{config.out_dir}/cache/{fp}'):
-        os.makedirs(f'{config.out_dir}/cache/{fp}')
+        wandb.init(project=config.wandb_project, config=config, mode='disabled', name=f'{config.model_name}-{config.input_dim}-{config.x_range}-{config.w_range}')
+
         # calculate the batch size
         # bz = max(1, int(200 / pz)) if config.batch_size is None else config.batch_size
+        pz_list = get_pz_list(config)
         bz = 1
         mse = torch.zeros(config.pz_count, dtype=torch.float32)
         tqdm_obj = tqdm(range(0, len(dataset), bz))
@@ -245,8 +305,12 @@ def main():
             elif config.api == 'togetherai':
                 assert bz == 1
                 answers = prompt_together_ai(batch, pz_list, config)
-            else:
+            elif config.api == 'baseline':
+                answers = get_baseline(batch, pz_list, config)
+            elif config.api is None:
                 answers = prompt_model(model, tokenizer, batch, pz_list, config)
+            else:
+                raise ValueError('Invalid api value')
             targets = dataset['targets'][bi:bi+bz][:, pz_list]
             all_answers.append(answers)
             all_targets.append(targets)
@@ -254,22 +318,18 @@ def main():
         all_targets = torch.cat(all_targets, dim=0)
         torch.save(all_answers, f'{config.out_dir}/cache/{fp}/answers.pt')
         torch.save(all_targets, f'{config.out_dir}/cache/{fp}/targets.pt')
+        torch.save(dataset, f'{config.out_dir}/cache/{fp}/dataset.pt')
         json.dump(config.__dict__, open(f'{config.out_dir}/cache/{fp}/config.json', 'w'))
+        torch.save(sim_model.state_dict(), f'{config.out_dir}/cache/{fp}/model.pt')
         print('Saved cache to ', f'{config.out_dir}/cache/{fp}')
+
+        mse, acc = evaluate(all_answers, all_targets, config)
+        mse_table = wandb.Table(columns=['Prompt size', 'MSE'], data=[[pz_list[i], mse[i].item()] for i in range(len(mse))])
+        wandb.log({'MSE vs Prompt Size': mse_table})
+        acc_table = wandb.Table(columns=['Prompt size', 'Accuracy'], data=[[pz_list[i], acc[i].item()] for i in range(len(acc))])
+        wandb.log({'Accuracy vs Prompt Size': acc_table})
     else:
-        all_answers = torch.load(f'{config.out_dir}/cache/{fp}/answers.pt')
-        all_targets = torch.load(f'{config.out_dir}/cache/{fp}/targets.pt')
-        new_fp = hasher.hash(config.__dict__)
-        os.makedirs(f'{config.out_dir}/cache/{new_fp}')
-        torch.save(all_answers, f'{config.out_dir}/cache/{new_fp}/answers.pt')
-        torch.save(all_targets, f'{config.out_dir}/cache/{new_fp}/targets.pt')
-        json.dump(config.__dict__, open(f'{config.out_dir}/cache/{fp}/config.json', 'w'))
-        # config = ScriptArguments(**json.load(open(f'{config.out_dir}/cache/{fp}/config.json')))
-    mse, acc = evaluate(all_answers, all_targets, config)
-    mse_table = wandb.Table(columns=['Prompt size', 'MSE'], data=[[pz_list[i], mse[i].item()] for i in range(len(mse))])
-    wandb.log({'MSE vs Prompt Size': mse_table})
-    acc_table = wandb.Table(columns=['Prompt size', 'Accuracy'], data=[[pz_list[i], acc[i].item()] for i in range(len(acc))])
-    wandb.log({'Accuracy vs Prompt Size': acc_table})
+        torch.save(dataset, f'{config.out_dir}/cache/{fp}/dataset.pt')
 
 if __name__ == '__main__':
     main()
