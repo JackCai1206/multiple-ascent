@@ -35,7 +35,7 @@ class ScriptArguments:
     # model arguments
     api: str | None = None
     model_name: str = "meta-llama/Meta-Llama-3-8B"
-    batch_size: int | None = None
+    batch_size: int | None = 1
     max_new_tokens: int = 10
 
     # dataset arguments
@@ -44,12 +44,14 @@ class ScriptArguments:
     pz_count: int = 5
     pz_dist: str = 'uniform'
     num_test_examples: int = 100
-    test_x_range: Optional[List[int]] = field(default_factory=lambda: [0, 1000])
+    test_x_range: Optional[List[int]] = None
 
     input_dim: int = 2
     w_range: List[int] = field(default_factory=lambda: [0, 1000])
     x_range: List[int] = field(default_factory=lambda: [0, 1000])
-    dataset_type: Literal['default', 'shuffle'] = 'default'
+    dataset_type: Literal['default', 'shuffle', 'perturb-input', 'perturb-context'] = 'default'
+    
+    same_last_example: bool = True
     
     def __post_init__(self):
         if self.test_x_range is None:
@@ -64,48 +66,70 @@ class IntegerRegressionModel(torch.nn.Module):
     def forward(self, x):
         return torch.round(self.linear(x))
 
-def get_dataset_generator(num_examples, model, config: ScriptArguments):
-    def get_example():
-        if j < config.pz_end:
-            r = config.x_range
-        else:
-            r = config.test_x_range 
+def get_dataset_generator(num_examples, model, pz_list, config: ScriptArguments):
+    def get_example(r):
         x = torch.randint(*r, (config.input_dim,)).float()
         with torch.no_grad():
-            y = model(x).int().numpy()[0]
-        return x.int().numpy(), y
+            y = model(x).int()[0]
+        return x.int(), y
 
+    last_example = get_example(config.test_x_range)
     for i in range(num_examples):
-        # set_seed(config.seed + i) # make sure the same sequrence of examples
-        if i > 0 and config.dataset_type == 'shuffle': # shuffle the same examples
-            ind = sample(range(len(examples)), len(examples))
-            examples, targets = [examples[r] for r in ind], [targets[r] for r in ind]
+        if i > 0 and config.dataset_type == 'shuffle':
+            def shuffle(x):
+                # shuffle the context except the last example
+                return x[torch.randperm(len(x) - 1).tolist() + [len(x)-1]]
+            xs, ys = [shuffle(xp) for xp in xs], [shuffle(yp) for yp in ys]
+        elif i > 0 and config.dataset_type == 'perturb-input':
+            # resample the last example (test_x_range is small) and set it for every prompt size
+            # keep everything else the same
+            last_example = get_example(config.test_x_range)
+            for xp in xs:
+                xp[-1] = last_example[0]
+            for yp in ys:
+                yp[-1] = last_example[1]
         else:
-            examples = []
-            targets = []
-            xs, ys = [], []
-            for j in range(config.pz_end + 1):
-                x, y = get_example()
-                x_str = ', '.join([str(x_i) for x_i in x])
-                examples.append(f'\nx={x_str}; y=')
-                targets.append(y)
-                xs.append(x)
-                ys.append(y)
+            # Generate fresh examples for each prompt size
+            xs = []
+            ys = []
+            for pz in pz_list:
+                xp, yp = [], []
+                for j in range(pz + 1):
+                    if j == pz:
+                        if config.same_last_example:
+                            x, y = last_example
+                        else:
+                            x, y = get_example(config.test_x_range)
+                    else:
+                        x, y = get_example(config.x_range)
+                    xp.append(x)
+                    yp.append(y)
+                xs.append(torch.stack(xp))
+                ys.append(torch.stack(yp))
         yield {
-            'examples': examples,
-            'targets': targets,
-            'x': xs,
-            'y': ys
+            'xs': xs,
+            'ys': ys
         }
 
-def build_prompt(examples: List[List[str]], targets: List[List[int]], pz: int):
-    prompt = []
-    for j in range(len(examples)):
-        prompt.append(
-            ''.join([f'{examples[j][i]}{targets[j][i]}' for i in range(pz)]) + examples[j][pz]
-        )
-    
-    return prompt
+def build_prompt(batch, pzi: int, text_format=True):
+    xp = batch['xs'][0][pzi].numpy()
+    yp = batch['ys'][0][pzi].numpy()
+    if text_format:
+        prompt = ''
+        target = yp[-1].item() # no formatting needed
+        for i, (x, y) in enumerate(zip(xp, yp)):
+            x_str = '[' + ', '.join(map(str, x)) + ']'
+            if i < len(xp) - 1:
+                prompt += f'\nx={x_str}; y={y}'
+            else:
+                prompt += f'\nx={x_str}; y='
+        return prompt, target
+    else:
+        x_train = xp[:-1]
+        y_train = yp[:-1]
+        x_test = xp[-1:]
+        y_test = yp[-1:].item()
+        return x_train, y_train, x_test, y_test
 
 def get_pz_list(config: ScriptArguments):
     if config.pz_dist == 'uniform':
@@ -126,8 +150,9 @@ def prompt_model(model: LlamaForCausalLM, tokenizer: LlamaTokenizerFast, batch, 
     generation_config = GenerationConfig(max_new_tokens=config.max_new_tokens, num_return_sequences=1, return_dict_in_generate=True, eos_token_id=[198, 11], pad_token_id=tokenizer.pad_token_id)
     kv_cache = DynamicCache()
     answers = []
-    for pz in pz_list:
-        prompt = build_prompt(batch['examples'], batch['targets'], pz)
+    targets = []
+    for pzi, pz in enumerate(pz_list):
+        prompt, target = build_prompt(batch, pzi)
         inputs = tokenizer(prompt, return_tensors="pt", padding='longest').to(config.device)
         with torch.no_grad():
             outputs = model.generate(**inputs, generation_config=generation_config, past_key_values=kv_cache)
@@ -137,24 +162,27 @@ def prompt_model(model: LlamaForCausalLM, tokenizer: LlamaTokenizerFast, batch, 
         if np.nan in answers_bi:
             print('Cannot parse output: ', prompt, output_strs)
         answers.append(answers_bi)
+        targets.append(target)
         kv_cache = outputs.past_key_values
         kv_cache = _crop_past_key_values(model, kv_cache, inputs.input_ids.shape[1])
     answers = torch.tensor(answers).T # (1, prompt_size)
+    targets = torch.tensor(targets).unsqueeze(0) # (1, prompt_size)
 
-    return answers
+    return answers, targets
 
 def prompt_claude(batch, pz_list, config):
     answers = []
+    targets = []
     client = anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
     total_tokens = 0
     tqdm_obj = tqdm(pz_list)
-    for pz in tqdm_obj:
-        prompt = build_prompt(batch['examples'], batch['targets'], pz)[0]
+    for pzi, pz in enumerate(tqdm_obj):
+        prompt, target = build_prompt(batch, pzi)
         message = client.messages.create(
             model=config.model_name,
             max_tokens=config.max_new_tokens,
             temperature=0.0,
-            system="Find the answer given the existing datapoints. Respond with only an integer valued answer and nothing else. Do not include any explanations.",
+            system="Your only job is to find the answer given the provided datapoints. Respond with only an integer valued answer and nothing else. Do not include any explanations. Do not output any steps.",
             messages=[
                 {"role": "user", "content": prompt}
             ]
@@ -163,61 +191,87 @@ def prompt_claude(batch, pz_list, config):
         if answers_bi is np.nan:
             print('Cannot parse output: ', prompt, message.content[0].text)
         answers.append(answers_bi)
+        targets.append(target)
         total_tokens += message.usage.input_tokens
         tqdm_obj.set_postfix({'Sent': message.usage.input_tokens})
     answers = torch.tensor(answers).unsqueeze(0) # (1, prompt_size)
+    targets = torch.tensor(targets).unsqueeze(0) # (1, prompt_size)
     print('Total tokens sent: ', total_tokens)
-    return answers
+    return answers, targets
 
-def prompt_together_ai(batch, pz_list, config):
+def prompt_together_ai(batch, pz_list, config: ScriptArguments):
+    is_chat = 'instruct' in config.model_name.lower()
+    
     answers = []
+    targets = []
     together = Together(api_key=os.environ['TOGETHER_AI_API_KEY'])
 
     total_tokens = 0
     tqdm_obj = tqdm(pz_list)
     
-    for pz in tqdm_obj:
-        prompt = build_prompt(batch['examples'], batch['targets'], pz)[0]
-        
-        output = together.completions.create(
-            prompt=f"{prompt}",
-            model=config.model_name,
-            max_tokens=config.max_new_tokens,
-            temperature=0.0,
-            top_k=1,
-            top_p=1
-        )
-        
-        generated_text = output.choices[0].text
+    for pzi, pz in enumerate(tqdm_obj):
+        prompt, target = build_prompt(batch, pzi)
+        if is_chat:
+            output = together.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": 'Your only job is to find the answer given the provided datapoints. Respond with only an integer valued answer and nothing else. Do not include any explanations.'},
+                    {"role": "user", "content": prompt},
+                ],
+                model=config.model_name,
+                max_tokens=config.max_new_tokens,
+                temperature=0.0,
+                top_k=1,
+                top_p=1
+            )
+            generated_text = output.choices[0].message.content
+        else:
+            output = together.completions.create(
+                prompt=f"{prompt}",
+                model=config.model_name,
+                max_tokens=config.max_new_tokens,
+                temperature=0.0,
+                top_k=1,
+                top_p=1
+            )
+            generated_text = output.choices[0].text
+
         total_tokens += output.usage.total_tokens
 
         answers_bi = int_or_nan(generated_text)
         if answers_bi is np.nan:
             print('Cannot parse output: ', prompt, generated_text)
         answers.append(answers_bi)
+        targets.append(target)
 
-        tqdm_obj.set_postfix({'Total tokens used': total_tokens})
+        tqdm_obj.set_postfix({'Sent': output.usage.total_tokens})
+    print('Total tokens sent: ', total_tokens)
 
     answers = torch.tensor(answers).unsqueeze(0)  # (1, prompt_size)
-    return answers
+    targets = torch.tensor(targets).unsqueeze(0)  # (1, prompt_size)
+    return answers, targets
 
 def get_baseline(batch, pz_list, config: ScriptArguments):
-    if config.model_name == 'KNN':
-        model = KNeighborsRegressor(n_neighbors=min(5, min(pz_list)))
-    elif config.model_name == 'Linear':
-        model = LinearRegression()
-    else:
-        raise ValueError('Invalid model_name')
     answers = []
-    for pz in pz_list:
-        x_train = batch['x'][0][:pz]
-        y_train = batch['y'][0][:pz]
-        x_test = batch['x'][0][pz].unsqueeze(0)
+    targets = []
+    for pzi, pz in enumerate(pz_list):
+        x_train, y_train, x_test, y_test = build_prompt(batch, pzi, text_format=False)
+        if 'KNN' in config.model_name:
+            if '-' in config.model_name:
+                k = int(config.model_name.split('-')[1])
+            else:
+                k = np.round(np.sqrt(pz)).astype(int)
+            model = KNeighborsRegressor(n_neighbors=k)
+        elif config.model_name == 'Linear':
+            model = LinearRegression()
+        else:
+            raise ValueError('Invalid model_name')
         answers_bi = model.fit(x_train, y_train).predict(x_test).tolist()
         answers.append(answers_bi)
+        targets.append(y_test)
     answers = torch.tensor(answers).T # (1, prompt_size)
+    targets = torch.tensor(targets).unsqueeze(0) # (1, prompt_size)
 
-    return answers
+    return answers, targets
 
 def evaluate(outputs, targets, config: ScriptArguments):
     acc = torch.mean((outputs == targets).float(), dim=0)
@@ -232,7 +286,13 @@ def evaluate(outputs, targets, config: ScriptArguments):
 def int_or_nan(x: str):
     match = re.match("\d+", x.strip())
     if match:
-        return int(match.group())
+        num = int(match.group())
+        try:
+            torch.tensor(num, dtype=torch.long)
+            return int(num)
+        except:
+            return np.nan
+        
     else:
         return np.nan
 
@@ -271,7 +331,8 @@ def main():
     sim_model = IntegerRegressionModel(config)
     print(sim_model.state_dict())
 
-    dataset = Dataset.from_generator(get_dataset_generator, gen_kwargs={'num_examples': config.num_test_examples, 'model': sim_model, 'config': config})
+    pz_list = get_pz_list(config)
+    dataset = Dataset.from_generator(get_dataset_generator, gen_kwargs={'num_examples': config.num_test_examples, 'model': sim_model, 'pz_list': pz_list, 'config': config})
     dataset.set_format(type='torch', output_all_columns=True)
 
     if not cache_found:
@@ -290,46 +351,53 @@ def main():
 
         # calculate the batch size
         # bz = max(1, int(200 / pz)) if config.batch_size is None else config.batch_size
-        pz_list = get_pz_list(config)
-        bz = 1
+        bz = config.batch_size
+        assert bz == 1, 'Batch size must be 1'
         mse = torch.zeros(config.pz_count, dtype=torch.float32)
         tqdm_obj = tqdm(range(0, len(dataset), bz))
         all_answers = []
         all_targets = []
         for bi in tqdm_obj:
             batch = dataset[bi:bi+bz]
-            if config.api == 'anthropic':
-                assert bz == 1
-                answers = prompt_claude(batch, pz_list, config)
-                # print(answers)
-            elif config.api == 'togetherai':
-                assert bz == 1
-                answers = prompt_together_ai(batch, pz_list, config)
-            elif config.api == 'baseline':
-                answers = get_baseline(batch, pz_list, config)
-            elif config.api is None:
-                answers = prompt_model(model, tokenizer, batch, pz_list, config)
-            else:
-                raise ValueError('Invalid api value')
-            targets = dataset['targets'][bi:bi+bz][:, pz_list]
+            retries = 3
+            while retries > 0:
+                try:
+                    if config.api == 'anthropic':
+                        answers, targets = prompt_claude(batch, pz_list, config)
+                        # print(answers)
+                    elif config.api == 'togetherai':
+                        answers, targets = prompt_together_ai(batch, pz_list, config)
+                    elif config.api == 'baseline':
+                        answers, targets = get_baseline(batch, pz_list, config)
+                    elif config.api is None:
+                        answers, targets = prompt_model(model, tokenizer, batch, pz_list, config)
+                    else:
+                        raise ValueError('Invalid api value')
+                    break
+                except Exception as e:
+                    print('Error: ', e)
+                    retries -= 1
+                    continue
             all_answers.append(answers)
             all_targets.append(targets)
         all_answers = torch.cat(all_answers, dim=0)
         all_targets = torch.cat(all_targets, dim=0)
         torch.save(all_answers, f'{config.out_dir}/cache/{fp}/answers.pt')
         torch.save(all_targets, f'{config.out_dir}/cache/{fp}/targets.pt')
-        torch.save(dataset, f'{config.out_dir}/cache/{fp}/dataset.pt')
+        dataset.to_csv(f'{config.out_dir}/cache/{fp}/dataset.csv')
         json.dump(config.__dict__, open(f'{config.out_dir}/cache/{fp}/config.json', 'w'))
         torch.save(sim_model.state_dict(), f'{config.out_dir}/cache/{fp}/model.pt')
         print('Saved cache to ', f'{config.out_dir}/cache/{fp}')
 
-        mse, acc = evaluate(all_answers, all_targets, config)
-        mse_table = wandb.Table(columns=['Prompt size', 'MSE'], data=[[pz_list[i], mse[i].item()] for i in range(len(mse))])
-        wandb.log({'MSE vs Prompt Size': mse_table})
-        acc_table = wandb.Table(columns=['Prompt size', 'Accuracy'], data=[[pz_list[i], acc[i].item()] for i in range(len(acc))])
-        wandb.log({'Accuracy vs Prompt Size': acc_table})
+        # Not using wandb for now
+        # mse, acc = evaluate(all_answers, all_targets, config)
+        # mse_table = wandb.Table(columns=['Prompt size', 'MSE'], data=[[pz_list[i], mse[i].item()] for i in range(len(mse))])
+        # wandb.log({'MSE vs Prompt Size': mse_table})
+        # acc_table = wandb.Table(columns=['Prompt size', 'Accuracy'], data=[[pz_list[i], acc[i].item()] for i in range(len(acc))])
+        # wandb.log({'Accuracy vs Prompt Size': acc_table})
     else:
-        torch.save(dataset, f'{config.out_dir}/cache/{fp}/dataset.pt')
+        all_answers = torch.load(f'{config.out_dir}/cache/{fp}/answers.pt')
+        all_targets = torch.load(f'{config.out_dir}/cache/{fp}/targets.pt')
 
 if __name__ == '__main__':
     main()
